@@ -2,24 +2,34 @@
 @file app.py
 @brief "Sistema Alumnos" de SecureDev: API y portal web de alumnos (Evaluación Parcial 3, OCY1102).
 
+VERSIÓN CORREGIDA (solución EV3). Correcciones aplicadas (cada una va en su commit VULN-xx):
+  - VULN-01: Inyección SQL en /alumnos/buscar  -> consulta parametrizada (CWE-89)
+  - VULN-02: XSS reflejado en /hello           -> se escapa la salida (CWE-79)
+  - VULN-03: MD5 y credenciales en el código   -> hash PBKDF2 + variables de entorno (CWE-327/798)
+  - VULN-04: debug=True en producción          -> debug por variable de entorno (CWE-489)
+  - VULN-05: cabeceras de seguridad faltantes  -> X-Content-Type-Options, X-Frame-Options, CSP
+
 Además de las rutas de negocio, la app publica métricas para Prometheus en /metrics.
 Las métricas de seguridad (logins fallidos y peticiones sospechosas) se ven en Grafana.
 """
-import hashlib
 import os
 import re
 import sqlite3
 import time
 
 from flask import Flask, Response, g, jsonify, render_template_string, request
+from markupsafe import escape
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
+from werkzeug.security import check_password_hash, generate_password_hash
 
 app = Flask(__name__)
 
-## Clave de la aplicación y credenciales del administrador.
-SECRET_KEY = "SecureDev-2024-clave-super-secreta"
-ADMIN_USUARIO = "admin"
-ADMIN_CLAVE_MD5 = "21232f297a57a5a743894a0e4a801fc3"
+## VULN-03: la clave de la app y las credenciales del admin salen del entorno, NO del código.
+SECRET_KEY = os.environ.get("SECRET_KEY", os.urandom(24).hex())
+ADMIN_USUARIO = os.environ.get("ADMIN_USUARIO", "admin")
+## Hash fuerte (PBKDF2 con sal). De respaldo se genera uno para que el laboratorio funcione;
+## en un entorno real este valor SIEMPRE vendría de una variable de entorno / gestor de secretos.
+ADMIN_CLAVE_HASH = os.environ.get("ADMIN_CLAVE_HASH", generate_password_hash("admin"))
 app.config["SECRET_KEY"] = SECRET_KEY
 
 ## Versión desplegada: la inyecta el pipeline (1.0.<build>+<commit>). Sirve para la trazabilidad.
@@ -124,14 +134,19 @@ def antes_de_la_peticion():
 @app.after_request
 def despues_de_la_peticion(respuesta):
     """!
-    @brief Registra la métrica de cada petición atendida.
+    @brief Registra la métrica de cada petición y agrega cabeceras de seguridad (VULN-05).
     @param respuesta Respuesta que Flask enviará al cliente.
-    @return La misma respuesta.
+    @return La misma respuesta, con cabeceras de seguridad.
     """
     endpoint = request.url_rule.rule if request.url_rule else "desconocido"
     if endpoint != "/metrics":
         HTTP_PETICIONES.labels(request.method, endpoint, str(respuesta.status_code)).inc()
         HTTP_LATENCIA.labels(endpoint).observe(time.perf_counter() - g.get("inicio", time.perf_counter()))
+    # VULN-05: cabeceras que ZAP pide (evitan sniffing de tipo, clickjacking e inyección de contenido).
+    respuesta.headers["X-Content-Type-Options"] = "nosniff"
+    respuesta.headers["X-Frame-Options"] = "DENY"
+    respuesta.headers["Content-Security-Policy"] = "default-src 'self'"
+    respuesta.headers["Referrer-Policy"] = "no-referrer"
     return respuesta
 
 
@@ -148,10 +163,11 @@ def portada():
 def hello():
     """!
     @brief Saluda al usuario cuyo nombre llega en el parámetro de URL «name».
-    @return Página HTML con el saludo.
+    @return Página HTML con el saludo (la entrada se escapa: VULN-02).
     """
     name = request.args.get("name", "visitante")
-    return f"<h1>Hola, {name}!</h1>"
+    # VULN-02: escape() convierte <script> en texto inofensivo -> no hay XSS reflejado.
+    return f"<h1>Hola, {escape(name)}!</h1>"
 
 
 @app.route("/health")
@@ -202,11 +218,14 @@ def buscar_alumnos():
     @return JSON con los alumnos encontrados.
     """
     nombre = request.args.get("nombre", "")
-    consulta = f"SELECT * FROM alumnos WHERE nombre LIKE '%{nombre}%'"
+    # VULN-01: consulta parametrizada. El valor viaja como DATO (?), nunca como código SQL.
+    consulta = "SELECT * FROM alumnos WHERE nombre LIKE ?"
     try:
-        filas = conectar().execute(consulta).fetchall()
-    except sqlite3.Error as error:
-        return jsonify({"error": str(error), "consulta": consulta}), 500
+        filas = conectar().execute(consulta, (f"%{nombre}%",)).fetchall()
+    except sqlite3.Error:
+        # No se devuelve la consulta ni el detalle del error (evita fuga de información, CWE-209).
+        app.logger.exception("Error al buscar alumnos")
+        return jsonify({"error": "No se pudo completar la búsqueda"}), 500
     return jsonify([dict(f) for f in filas])
 
 
@@ -218,7 +237,8 @@ def login():
     """
     usuario = request.form.get("usuario", "")
     clave = request.form.get("clave", "")
-    if usuario == ADMIN_USUARIO and hashlib.md5(clave.encode()).hexdigest() == ADMIN_CLAVE_MD5:
+    # VULN-03: verificación con hash fuerte (PBKDF2 + sal), no con MD5.
+    if usuario == ADMIN_USUARIO and check_password_hash(ADMIN_CLAVE_HASH, clave):
         LOGIN_EXITOSOS.inc()
         return jsonify({"mensaje": "Bienvenido, administrador"})
     LOGIN_FALLIDOS.inc()
@@ -238,4 +258,8 @@ def metrics():
 iniciar_db()
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    # VULN-04: el modo debug queda APAGADO salvo que se pida explícitamente por entorno.
+    debug = os.environ.get("FLASK_DEBUG", "0") == "1"
+    # Escuchar en 0.0.0.0 es intencional: la app corre DENTRO del contenedor y Docker
+    # la publica solo en 127.0.0.1 del equipo (ver compose.yaml). Por eso se marca nosec.
+    app.run(host="0.0.0.0", port=5000, debug=debug)  # nosec B104
