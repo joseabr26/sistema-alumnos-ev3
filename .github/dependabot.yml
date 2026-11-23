@@ -1,0 +1,14 @@
+# Ubícalo en:  .github/dependabot.yml  (en la raíz de TU repositorio de GitHub)
+# Dependabot revisa las dependencias y abre un Pull Request por cada actualización disponible.
+version: 2
+updates:
+  - package-ecosystem: "pip"          # ecosistema de requirements.txt
+    directory: "/"                    # carpeta donde está requirements.txt (raíz del repo)
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "deps"                  # los commits/PR empiezan con "deps:" (trazabilidad)
+    labels:
+      - "dependencies"
+      - "security"
