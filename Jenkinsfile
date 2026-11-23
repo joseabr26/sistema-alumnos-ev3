@@ -1,17 +1,17 @@
-// Jenkinsfile - Pipeline de "Sistema Alumnos" (SecureDev · Evaluación Parcial 3 · OCY1102)
+// Jenkinsfile LIVIANO (sin OWASP ZAP) - "Sistema Alumnos" (SecureDev · EV3 · OCY1102)
 //
-// VERSIÓN RESUELTA: Build -> Test -> SAST (Bandit) -> Dependencias (pip-audit)
-//                   -> Deploy Staging -> DAST (OWASP ZAP) -> [gate] -> Deploy Producción
+// Versión para equipos con poca RAM: Build -> Test -> SAST (Bandit) -> SCA (pip-audit) -> Deploy Producción.
+// La etapa DAST (OWASP ZAP) y el Deploy Staging se OMITEN aquí porque ZAP (Java) necesita mucha memoria.
+// Esa etapa (Evidencias 5 y 6) se ejecuta en un PC del laboratorio con más RAM, usando el Jenkinsfile completo.
 pipeline {
     agent any
 
     options {
         timestamps()
-        timeout(time: 40, unit: 'MINUTES')
+        timeout(time: 30, unit: 'MINUTES')
         disableConcurrentBuilds()
     }
 
-    // Revisa GitHub cada ~3 minutos: cada push (tuyo o un PR de Dependabot fusionado) dispara un build.
     triggers {
         pollSCM('H/3 * * * *')
     }
@@ -24,13 +24,11 @@ pipeline {
         stage('Build') {
             steps {
                 script {
-                    // Versión = 1.0.<nº de build>+<commit corto>: une cada despliegue con su commit (trazabilidad)
                     def sha = sh(returnStdout: true, script: 'git rev-parse --short HEAD').trim()
                     env.APP_VERSION = "1.0.${env.BUILD_NUMBER}+${sha}"
                 }
                 echo "Versión de este build: ${env.APP_VERSION}"
                 sh 'git log -1 --format="Commit %h de %an: %s"'
-                // Cada build parte limpio: sin reportes viejos y con un entorno virtual nuevo
                 sh 'rm -rf .venv reports && mkdir -p reports'
                 sh 'python3 -m venv .venv'
                 sh '.venv/bin/pip install --quiet -r requirements.txt -r requirements-dev.txt'
@@ -49,11 +47,8 @@ pipeline {
             }
         }
 
-        // >>> [SEGURIDAD]: revisiones de seguridad continuas (SAST + dependencias)
         stage('Security Review (SAST)') {
-            // Bandit está preinstalado en la imagen (/opt/herramientas/bin). Analiza el código estáticamente.
             steps {
-                // No se hace fallar el build por hallazgos: se generan los reportes para documentar y trazar.
                 sh 'bandit -r app.py -f json -o reports/bandit.json || true'
                 sh 'bandit -r app.py -f txt  -o reports/bandit.txt  || true'
             }
@@ -63,7 +58,6 @@ pipeline {
         }
 
         stage('Dependency Management') {
-            // pip-audit (SCA) revisa requirements.txt contra la base de CVEs.
             steps {
                 sh 'pip-audit -r requirements.txt -f json -o reports/pip-audit.json || true'
                 sh 'pip-audit -r requirements.txt           -o reports/pip-audit.txt  || true'
@@ -73,35 +67,7 @@ pipeline {
             }
         }
 
-        // >>> [ZAP]: desplegar en staging y escanearlo con OWASP ZAP (DAST)
-        stage('Deploy Staging') {
-            steps {
-                sh 'bash scripts/deploy.sh staging 5001'
-            }
-        }
-
-        stage('DAST - OWASP ZAP') {
-            steps {
-                script {
-                    // zap_scan.py termina con código 2 si hay alertas High/Medium -> marcamos UNSTABLE.
-                    // ZAP_MINUTOS_ACTIVO=2 acorta el escaneo activo (equipo con poca RAM); detecta igual SQLi/XSS.
-                    def rc = sh(returnStatus: true,
-                                script: 'ZAP_MINUTOS_ACTIVO=2 python3 scripts/zap_scan.py http://jenkins:5001')
-                    if (rc == 2) {
-                        currentBuild.result = 'UNSTABLE'
-                        echo 'ZAP encontró alertas High/Medium: build UNSTABLE (revisa reports/zap-report.html).'
-                    } else if (rc != 0) {
-                        error("El escaneo ZAP falló con código ${rc}")
-                    }
-                }
-            }
-            post {
-                always { archiveArtifacts artifacts: 'reports/zap-*', allowEmptyArchive: true }
-            }
-        }
-
         stage('Deploy Producción') {
-            // >>> [GATE]: producción solo se despliega si el build sigue SANO (tests OK y ZAP sin High/Medium).
             when { expression { currentBuild.currentResult == 'SUCCESS' } }
             steps {
                 sh 'bash scripts/deploy.sh produccion 5000'
@@ -112,7 +78,6 @@ pipeline {
 
     post {
         always {
-            // Registro de trazabilidad: build <-> versión <-> commit <-> pruebas <-> hallazgos <-> despliegue
             withEnv(["RESULTADO=${currentBuild.currentResult}"]) {
                 sh 'python3 scripts/trazabilidad.py'
             }
