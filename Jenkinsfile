@@ -1,7 +1,7 @@
 // Jenkinsfile - Pipeline de "Sistema Alumnos" (SecureDev · Evaluación Parcial 3 · OCY1102)
 //
-// Esta es la versión BASE: construye, prueba y despliega en producción.
-// Los marcadores  >>> [ETIQUETA]  indican dónde agregar las etapas de seguridad.
+// VERSIÓN RESUELTA: Build -> Test -> SAST (Bandit) -> Dependencias (pip-audit)
+//                   -> Deploy Staging -> DAST (OWASP ZAP) -> [gate] -> Deploy Producción
 pipeline {
     agent any
 
@@ -49,12 +49,59 @@ pipeline {
             }
         }
 
-        // >>> [SEGURIDAD]: aquí van las etapas "Security Review (SAST)" y "Dependency Management"
+        // >>> [SEGURIDAD]: revisiones de seguridad continuas (SAST + dependencias)
+        stage('Security Review (SAST)') {
+            // Bandit está preinstalado en la imagen (/opt/herramientas/bin). Analiza el código estáticamente.
+            steps {
+                // No se hace fallar el build por hallazgos: se generan los reportes para documentar y trazar.
+                sh 'bandit -r app.py -f json -o reports/bandit.json || true'
+                sh 'bandit -r app.py -f txt  -o reports/bandit.txt  || true'
+            }
+            post {
+                always { archiveArtifacts artifacts: 'reports/bandit.*', allowEmptyArchive: true }
+            }
+        }
 
-        // >>> [ZAP]: aquí van las etapas "Deploy Staging" y "DAST - OWASP ZAP"
+        stage('Dependency Management') {
+            // pip-audit (SCA) revisa requirements.txt contra la base de CVEs.
+            steps {
+                sh 'pip-audit -r requirements.txt -f json -o reports/pip-audit.json || true'
+                sh 'pip-audit -r requirements.txt           -o reports/pip-audit.txt  || true'
+            }
+            post {
+                always { archiveArtifacts artifacts: 'reports/pip-audit.*', allowEmptyArchive: true }
+            }
+        }
+
+        // >>> [ZAP]: desplegar en staging y escanearlo con OWASP ZAP (DAST)
+        stage('Deploy Staging') {
+            steps {
+                sh 'bash scripts/deploy.sh staging 5001'
+            }
+        }
+
+        stage('DAST - OWASP ZAP') {
+            steps {
+                script {
+                    // zap_scan.py termina con código 2 si hay alertas High/Medium -> marcamos UNSTABLE.
+                    def rc = sh(returnStatus: true,
+                                script: 'python3 scripts/zap_scan.py http://jenkins:5001')
+                    if (rc == 2) {
+                        currentBuild.result = 'UNSTABLE'
+                        echo 'ZAP encontró alertas High/Medium: build UNSTABLE (revisa reports/zap-report.html).'
+                    } else if (rc != 0) {
+                        error("El escaneo ZAP falló con código ${rc}")
+                    }
+                }
+            }
+            post {
+                always { archiveArtifacts artifacts: 'reports/zap-*', allowEmptyArchive: true }
+            }
+        }
 
         stage('Deploy Producción') {
-            // >>> [GATE]: aquí va la condición "when" que protege producción
+            // >>> [GATE]: producción solo se despliega si el build sigue SANO (tests OK y ZAP sin High/Medium).
+            when { expression { currentBuild.currentResult == 'SUCCESS' } }
             steps {
                 sh 'bash scripts/deploy.sh produccion 5000'
                 script { env.PRODUCCION = env.APP_VERSION }
