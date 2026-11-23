@@ -84,8 +84,9 @@ pipeline {
             steps {
                 script {
                     // zap_scan.py termina con código 2 si hay alertas High/Medium -> marcamos UNSTABLE.
+                    // ZAP_MINUTOS_ACTIVO=2 acorta el escaneo activo (equipo con poca RAM); detecta igual SQLi/XSS.
                     def rc = sh(returnStatus: true,
-                                script: 'python3 scripts/zap_scan.py http://jenkins:5001')
+                                script: 'ZAP_MINUTOS_ACTIVO=2 python3 scripts/zap_scan.py http://jenkins:5001')
                     if (rc == 2) {
                         currentBuild.result = 'UNSTABLE'
                         echo 'ZAP encontró alertas High/Medium: build UNSTABLE (revisa reports/zap-report.html).'
